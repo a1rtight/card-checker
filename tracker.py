@@ -64,6 +64,25 @@ def blobs(px, w, h):
                 yield blob
 
 
+def scan_crop(image_url):
+    """CSS transform that crops the black border pricecharting scans have round the card (left, top, right, bottom
+    fractions found per scan: rows/cols near black in the middle of each side), so it doesn't read as a shadow."""
+    if not image_url:
+        return ""
+    from io import BytesIO
+    from PIL import Image
+    im = Image.open(BytesIO(urllib.request.urlopen(urllib.request.Request(image_url, headers={"User-Agent": UA}), timeout=30).read())).convert("L")
+    w, h = im.size
+    px = im.load()
+    def run(get, n):  # how many leading pixels are near-black, sampled across the middle half of that side
+        return max(next((i for i in range(n // 4) if get(i, k) > 40), 0) for k in range(int(0.25 * (w if n == h else h)), int(0.75 * (w if n == h else h)), 7))
+    l = run(lambda i, k: px[i, k], w); r = run(lambda i, k: px[w - 1 - i, k], w)
+    t = run(lambda i, k: px[k, i], h); b = run(lambda i, k: px[k, h - 1 - i], h)
+    l, r, t, b = (l + 1) / w, (r + 1) / w, (t + 1) / h, (b + 1) / h   # +1 px for the anti-aliased edge
+    sx, sy = 1 / (1 - l - r), 1 / (1 - t - b)
+    return f"transform-origin:0 0;transform:scale({sx:.5f},{sy:.5f}) translate({-l * 100:.3f}%,{-t * 100:.3f}%)"
+
+
 def foil_mask(image_url):
     """Opaque = foil. Vintage holos only foil the art background, the pokemon is printed over it in solid ink.
     Generated once per card; edit the PNG by hand if the guess is off and it won't be overwritten."""
@@ -498,6 +517,17 @@ if ((BACK.opacity ?? 0) > 0) {
   const backing = new THREE.MeshBasicMaterial({ color: BACK.color ?? "#ffffff", transparent: true, opacity: BACK.opacity, depthWrite: false });
   for (const m of [...slab.children]) if (m.material === frosted) { const b = new THREE.Mesh(m.geometry, backing); b.renderOrder = -1; slab.add(b); }
 }
+// window backing: light behind the clear card window (on the well floor, under the card), so the gaps round the card's
+// rounded corners don't show the page through as dark squares; the card covers the rest
+{
+  const WB = SET.windowBacking ?? {};
+  if ((WB.opacity ?? 0) > 0 && LAYOUT.lid_clear) {
+    const [wx0, wy0, wx1, wy1] = LAYOUT.lid_clear[0];   // exact window rect, just behind the card (the card's stand-in hides the rest)
+    const wb = new THREE.Mesh(new THREE.PlaneGeometry(Math.abs(wx1 - wx0), Math.abs(wy1 - wy0)),
+      new THREE.MeshBasicMaterial({ color: WB.color ?? "#d8d8d8", transparent: true, opacity: WB.opacity, depthWrite: false }));
+    wb.position.set((wx0 + wx1) / 2, (wy0 + wy1) / 2, LAYOUT.card[2] - 0.5); wb.renderOrder = -1; slab.add(wb);
+  }
+}
 // see-through plastic: render both sides, so the back face and far walls show through the near ones
 // (three draws transparent double-sided meshes back faces first, then front)
 for (const m of slab.children) if (m.isMesh) m.material.side = THREE.DoubleSide;
@@ -512,11 +542,28 @@ for (const [sel, pos] of [[".card", LAYOUT.card], [".psa-label", LAYOUT.label]])
   slab.add(o);
 }
 stage.classList.add("ready");
+// card shadow (slab-settings cardShadow, in screen px): converted to the card element's own px (it is scaled by CSS3D)
+{
+  const rotEl = stage.querySelector(".card__rotator"), px = SET.cardShadow ?? 5;
+  rotEl.style.setProperty("overflow", "hidden");            // clips the cropped scan to the card's rounded outline
+  const k = rotEl.offsetWidth / Math.max(1, rotEl.getBoundingClientRect().width);
+  rotEl.style.setProperty("box-shadow", px > 0 ? `0 ${px * 0.4 * k}px ${px * k}px rgba(0,0,0,.45)` : "none", "important");
+}
 // depth-only stand-ins for the card and label: the CSS layer sits under the WebGL canvas, so without these the slab's
 // back face (behind the card) would paint over it now that back faces render
 const occlude = new THREE.MeshBasicMaterial({ colorWrite: false });
-for (const [sel, pos] of [[".card", LAYOUT.card], [".psa-label", LAYOUT.label]]) {
-  const el = stage.querySelector(sel), m = new THREE.Mesh(new THREE.PlaneGeometry(el.offsetWidth * 0.1, el.offsetHeight * 0.1), occlude);
+// shaped like the element itself (its computed border-radius, elliptical), so no square corners show past a rounded card
+function roundedPlane(el) {
+  const w = el.offsetWidth * 0.1, h = el.offsetHeight * 0.1, r = getComputedStyle(el).borderTopLeftRadius.split(" ");
+  const pct = (v, size) => (v.endsWith("%") ? parseFloat(v) / 100 * size : parseFloat(v)) * 0.1;   // element px -> mm
+  const rx = Math.min(w / 2, pct(r[0], el.offsetWidth)), ry = Math.min(h / 2, pct(r[1] ?? r[0], el.offsetHeight));
+  const x = w / 2, y = h / 2, pts = [], seg = 12;
+  for (const [cx, cy, a0] of [[x - rx, y - ry, 0], [-x + rx, y - ry, 90], [-x + rx, -y + ry, 180], [x - rx, -y + ry, 270]])
+    for (let i = 0; i <= seg; i++) { const a = (a0 + 90 * i / seg) * Math.PI / 180; pts.push(new THREE.Vector2(cx + rx * Math.cos(a), cy + ry * Math.sin(a))); }
+  return new THREE.ShapeGeometry(new THREE.Shape(pts));
+}
+for (const [sel, shapeSel, pos] of [[".card", ".card__rotator", LAYOUT.card], [".psa-label", ".psa-label", LAYOUT.label]]) {
+  const m = new THREE.Mesh(roundedPlane(stage.querySelector(shapeSel)), occlude);
   m.position.set(...pos); m.renderOrder = -10; slab.add(m);
 }
 const fit = () => {
@@ -625,7 +672,7 @@ th{{color:var(--muted);font-weight:500}}.num{{text-align:right;font-variant-nume
 </style></head><body><main>
 <aside>{'<div class="stage">' if slab else ""}{f'''<div class="card interactive{" masked" if mask else ""}" data-rarity="{foil()}" data-subtypes="basic" data-supertype="pokémon"
  data-era="{"vintage" if vintage() else "modern"}"{f' style="--mask:url({e(mask)})"' if mask else ""}><div class="card__translater"><div class="card__rotator">
- <div class="card__front"><img src="{e(pc["image"])}" alt="{e(CARD["name"])}" width="660" height="921"><div class="card__shine"></div><div class="card__glare"></div></div>
+ <div class="card__front" style="{scan_crop(pc["image"])}"><img src="{e(pc["image"])}" alt="{e(CARD["name"])}" width="660" height="921"><div class="card__shine"></div><div class="card__glare"></div></div>
 </div></div></div>''' if pc["image"] else ""}{label + "</div>" if slab else ""}
 <h1>{e(CARD["name"])}</h1><span class="grade">{e(CARD["grade"])}</span>
 {f'''<div class="cur" role="group" aria-label="Currency"><button data-cur="GBP" aria-pressed="true">£ GBP</button><button data-cur="USD" aria-pressed="false">$ USD</button></div>
